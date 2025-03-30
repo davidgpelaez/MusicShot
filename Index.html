@@ -81,354 +81,93 @@
     </div>
 
     <audio id="audioPlayer" style="display: none;"></audio>
-        async function analyzeOnsets() {
-            detectedOnsets = []; // Limpiar detecciones previas
-             if (!audioBuffer) return;
+                          
+<script>
+    document.addEventListener('DOMContentLoaded', (event) => {
+        // *** Mensaje de prueba inicial ***
+        console.log("Dentro de DOMContentLoaded. ¿Existe Meyda?:", window.Meyda);
+        // ********************************
 
-            // Usar OfflineAudioContext para análisis no en tiempo real
-            const offlineContext = new OfflineAudioContext(
-                audioBuffer.numberOfChannels,
-                audioBuffer.length,
-                audioBuffer.sampleRate
-            );
+        const audioFile = document.getElementById('audioFile');
+        const analyzeButton = document.getElementById('analyzeButton');
+        const statusDiv = document.getElementById('status');
+        const visualizerDiv = document.getElementById('visualizer');
+        const onsetIndicator = document.getElementById('onsetIndicator');
+        const audioPlayer = document.getElementById('audioPlayer'); // No usado activamente para play, pero referenciado
 
-            const offlineSource = offlineContext.createBufferSource();
-            offlineSource.buffer = audioBuffer;
+        let audioContext;
+        let audioBuffer;
+        let detectedOnsets = [];
+        let meydaAnalyzer;
+        let sourceNode;
+        let animationFrameId;
 
-            // Configurar Meyda para el análisis offline
-            meydaAnalyzer = Meyda.createMeydaAnalyzer({
-                audioContext: offlineContext, // IMPORTANTE: Usar el contexto offline
-                source: offlineSource,
-                bufferSize: MEYDA_BUFFER_SIZE,
-                featureExtractors: ["rms", "spectralCentroid"], // Características necesarias
-                callback: features => {
-                     // Lógica simple de detección de onset basada en RMS
-                     // Necesitamos comparar con el frame anterior, así que guardamos el último RMS
-                     if (typeof meydaAnalyzer.lastRms === 'undefined') {
-                         meydaAnalyzer.lastRms = 0;
-                     }
+        // --- Parámetros Ajustables ---
+        // Generales
+        const SPECTRAL_CENTROID_THRESHOLD = 1000; // Hz. Umbral Agudo/Grave (BAJAR si no detecta agudos)
+        const MEYDA_BUFFER_SIZE = 1024;
+        const DISPLAY_DURATION = 150; // ms
+        const DEBOUNCE_TIME = 0.075; // (Segundos) Tiempo mínimo entre onsets detectados (75ms)
 
-                     const currentRms = features.rms;
-                     // Detecta un pico si el RMS actual supera un umbral Y es significativamente mayor que el anterior
-                      // Una lógica más robusta podría mirar una ventana de RMS o usar spectralFlux
-                     if (currentRms > RMS_THRESHOLD && currentRms > meydaAnalyzer.lastRms * 1.5) { // El 1.5 es otro umbral ajustable
-                         const timestamp = (meydaAnalyzer.framesElapsed * MEYDA_BUFFER_SIZE) / audioBuffer.sampleRate;
-                         const spectralCentroid = features.spectralCentroid;
+        // Para detección ESTÁNDAR (más estricta, para golpes principales)
+        const RMS_THRESHOLD = 0.03; // Umbral RMS mínimo (SUBIR si hay demasiados onsets)
+        const PEAK_MULTIPLIER = 2.0; // Factor de pico sobre RMS anterior (SUBIR si hay demasiados onsets)
 
-                         const onsetType = spectralCentroid > SPECTRAL_CENTROID_THRESHOLD ? 'agudo' : 'grave';
+        // Para detección SENSIBLE de AGUDOS (más permisiva, para intentar capturar agudos débiles)
+        const AGUDO_RMS_THRESHOLD = 0.018; // Umbral RMS más bajo para agudos (AJUSTAR)
+        const AGUDO_PEAK_MULTIPLIER = 1.4; // Multiplicador de pico más bajo para agudos (AJUSTAR)
+        // --------------------------
 
-                         // Evitar onsets muy seguidos (opcional, ajustar tiempo)
-                          const lastOnset = detectedOnsets[detectedOnsets.length - 1];
-                          if (!lastOnset || timestamp > lastOnset.timestamp + 0.05) { // No detectar si es menos de 50ms después
-                            detectedOnsets.push({ timestamp: timestamp, type: onsetType });
-                          }
-                     }
-                      meydaAnalyzer.lastRms = currentRms; // Guarda el RMS para la próxima comparación
-                     meydaAnalyzer.framesElapsed = (meydaAnalyzer.framesElapsed || 0) + 1; // Contador manual de frames
+
+        function initAudioContext() {
+            if (!audioContext) {
+                try {
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    console.log("AudioContext iniciado.");
+                } catch (e) {
+                    statusDiv.textContent = 'Error: La Web Audio API no es soportada por este navegador.';
+                    console.error(e);
                 }
-            });
-             meydaAnalyzer.start();
-             offlineSource.start(0); // Empezar a procesar desde el inicio
-
-             // Esperar a que el contexto offline termine el renderizado/análisis
-            return offlineContext.startRendering().then(() => {
-                 meydaAnalyzer.stop(); // Detener el analizador Meyda
-                 console.log("Análisis offline completado.");
-            }).catch(err => {
-                console.error("Error durante el análisis offline:", err);
-                statusDiv.textContent = 'Error durante el análisis offline.';
-            });
+            }
         }
 
-
-        function startPlaybackAndVisualization() {
-            // Detener reproducción anterior si existe
-            if (sourceNode) {
-                try {
-                    sourceNode.stop();
-                 } catch(e) {console.warn("Error stopping previous node", e)}
-            }
-             if (animationFrameId) {
-                cancelAnimationFrame(animationFrameId);
-            }
-
-            sourceNode = audioContext.createBufferSource();
-            sourceNode.buffer = audioBuffer;
-            sourceNode.connect(audioContext.destination);
-
-            const startTime = audioContext.currentTime;
-            let onsetIndex = 0; // Para seguir qué onsets ya hemos mostrado
-
-            function visualizationLoop() {
-                 if (!sourceNode) return; // Detener si la fuente no existe
-
-                const elapsedTime = audioContext.currentTime - startTime;
-
-                // Buscar el próximo onset que deba mostrarse
-                 while (onsetIndex < detectedOnsets.length && detectedOnsets[onsetIndex].timestamp <= elapsedTime + 0.05) { // Un pequeño adelanto para la reacción visual
-                     const onset = detectedOnsets[onsetIndex];
-
-                     // Mostrar el indicador visual
-                     onsetIndicator.textContent = onset.type.toUpperCase();
-                     onsetIndicator.className = `onset-display ${onset.type}`; // Clase 'grave' o 'agudo'
-
-                      // Opcional: Cambiar fondo brevemente
-                      visualizerDiv.style.backgroundColor = onset.type === 'grave' ? 'rgba(0, 0, 255, 0.2)' : 'rgba(255, 0, 0, 0.2)';
-
-
-                     // Limpiar el indicador después de un tiempo
-                     setTimeout(() => {
-                         // Solo limpiar si este es el último onset mostrado
-                         if(onsetIndex >= detectedOnsets.length || detectedOnsets[onsetIndex].timestamp > elapsedTime) {
-                              onsetIndicator.textContent = '';
-                              onsetIndicator.className = 'onset-display';
-                              visualizerDiv.style.backgroundColor = '#fff'; // Volver al fondo original
-                         }
-                     }, DISPLAY_DURATION);
-
-                     onsetIndex++;
-                 }
-
-
-                // Continuar el bucle mientras la música suena (aproximado)
-                 if (elapsedTime < audioBuffer.duration) {
-                    animationFrameId = requestAnimationFrame(visualizationLoop);
-                } else {
-                     statusDiv.textContent = 'Reproducción finalizada.';
-                     onsetIndicator.textContent = '';
-                     onsetIndicator.className = 'onset-display';
-                     visualizerDiv.style.backgroundColor = '#fff';
-                     analyzeButton.disabled = false; // Habilitar de nuevo
-                 }
-            }
-    <script>
-        // Espera a que todo el HTML esté cargado antes de ejecutar el script
-        document.addEventListener('DOMContentLoaded', (event) => {
-
-            const audioFile = document.getElementById('audioFile');
-            const analyzeButton = document.getElementById('analyzeButton');
-            const statusDiv = document.getElementById('status');
-            const visualizerDiv = document.getElementById('visualizer');
-            const onsetIndicator = document.getElementById('onsetIndicator');
-            const audioPlayer = document.getElementById('audioPlayer');
-
-            let audioContext;
-            let audioBuffer;
-            let detectedOnsets = [];
-            let meydaAnalyzer;
-            let sourceNode;
-            let animationFrameId;
-
-            // --- Parámetros Ajustables ---
-            const RMS_THRESHOLD = 0.04;
-            const SPECTRAL_CENTROID_THRESHOLD = 1000;
-            const MEYDA_BUFFER_SIZE = 1024;
-            const DISPLAY_DURATION = 150;
-            // --------------------------
-
-            function initAudioContext() {
-                if (!audioContext) {
-                    try {
-                        audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                        console.log("AudioContext iniciado.");
-                    } catch (e) {
-                        statusDiv.textContent = 'Error: La Web Audio API no es soportada por este navegador.';
-                        console.error(e);
-                    }
-                }
-            }
-
-            audioFile.addEventListener('change', () => {
-                initAudioContext(); // Inicia aquí por si acaso el usuario interactúa primero con el input
-                if (audioFile.files.length > 0 && audioContext) {
-                    analyzeButton.disabled = false;
-                    statusDiv.textContent = 'Archivo listo para analizar.';
-                } else {
-                    analyzeButton.disabled = true;
-                }
-            });
-
-            analyzeButton.addEventListener('click', async () => {
-                if (!audioFile.files.length || !audioContext) return;
-
-                // Asegurarse de que el context está iniciado (importante si no se hizo antes)
-                 if (audioContext.state === 'suspended') {
-                    await audioContext.resume();
-                 }
-
-
+        audioFile.addEventListener('change', () => {
+            initAudioContext();
+            if (audioFile.files.length > 0 && audioContext) {
+                analyzeButton.disabled = false;
+                statusDiv.textContent = 'Archivo listo para analizar.';
+            } else {
                 analyzeButton.disabled = true;
-                statusDiv.textContent = 'Leyendo archivo...';
+            }
+        });
 
-                const file = audioFile.files[0];
-                const reader = new FileReader();
+        analyzeButton.addEventListener('click', async () => {
+            if (!audioFile.files.length || !audioContext) return;
+            if (audioContext.state === 'suspended') {
+                await audioContext.resume();
+            }
 
-                reader.onload = async (e) => {
-                    try {
-                        statusDiv.textContent = 'Decodificando audio... (esto puede tardar)';
-                        audioBuffer = await audioContext.decodeAudioData(e.target.result);
-                        statusDiv.textContent = 'Audio decodificado. Analizando onsets...';
-                        console.log("Audio Buffer listo, Sample Rate:", audioBuffer.sampleRate, "Duración:", audioBuffer.duration);
+            analyzeButton.disabled = true;
+            statusDiv.textContent = 'Leyendo archivo...';
+            const file = audioFile.files[0];
+            const reader = new FileReader();
 
-                        await analyzeOnsets();
-
-                        statusDiv.textContent = `Análisis completo. ${detectedOnsets.length} onsets detectados. Reproduciendo...`;
-                        console.log("Onsets detectados:", detectedOnsets);
-
-                        startPlaybackAndVisualization();
-
-                    } catch (error) {
-                        statusDiv.textContent = `Error procesando el audio: ${error.message}`;
-                        console.error('Error:', error);
-                        analyzeButton.disabled = false;
-                    }
-                };
-
-                reader.onerror = (error) => {
-                    statusDiv.textContent = 'Error leyendo el archivo.';
-                    console.error('Error FileReader:', error);
-                    analyzeButton.disabled = false;
-                };
-
-                reader.readAsArrayBuffer(file);
-            });
-
-            async function analyzeOnsets() {
-                 detectedOnsets = [];
-                 if (!audioBuffer) return;
-
-                const offlineContext = new OfflineAudioContext(
-                    audioBuffer.numberOfChannels,
-                    audioBuffer.length,
-                    audioBuffer.sampleRate
-                );
-
-                const offlineSource = offlineContext.createBufferSource();
-                offlineSource.buffer = audioBuffer;
-
-                // --- AQUÍ ES DONDE SE USA MEYDA ---
-                // Si la librería no cargó, esto fallará.
+            reader.onload = async (e) => {
                 try {
-                     meydaAnalyzer = Meyda.createMeydaAnalyzer({
-                        audioContext: offlineContext,
-                        source: offlineSource,
-                        bufferSize: MEYDA_BUFFER_SIZE,
-                        featureExtractors: ["rms", "spectralCentroid"],
-                        callback: features => {
-                            if (typeof meydaAnalyzer.lastRms === 'undefined') {
-                                meydaAnalyzer.lastRms = 0;
-                            }
-                             const currentRms = features.rms;
-                             if (currentRms > RMS_THRESHOLD && currentRms > meydaAnalyzer.lastRms * 1.5) {
-                                const timestamp = (meydaAnalyzer.framesElapsed * MEYDA_BUFFER_SIZE) / audioBuffer.sampleRate;
-                                const spectralCentroid = features.spectralCentroid;
-                                const onsetType = spectralCentroid > SPECTRAL_CENTROID_THRESHOLD ? 'agudo' : 'grave';
-
-                                const lastOnset = detectedOnsets[detectedOnsets.length - 1];
-                                if (!lastOnset || timestamp > lastOnset.timestamp + 0.05) {
-                                    detectedOnsets.push({ timestamp: timestamp, type: onsetType });
-                                }
-                            }
-                            meydaAnalyzer.lastRms = currentRms;
-                            meydaAnalyzer.framesElapsed = (meydaAnalyzer.framesElapsed || 0) + 1;
-                        }
-                    });
-                 } catch (e) {
-                    // Si falla aquí, es que Meyda no está definido
-                    console.error("ERROR: Meyda no está definido al intentar crear el analizador.", e);
-                    statusDiv.textContent = "Error fatal: La librería Meyda no se cargó correctamente.";
-                    throw new Error("Meyda library not loaded"); // Detiene la ejecución
-                 }
-                // ------------------------------------
-
-
-                meydaAnalyzer.start();
-                offlineSource.start(0);
-
-                return offlineContext.startRendering().then(() => {
-                    meydaAnalyzer.stop();
-                    console.log("Análisis offline completado.");
-                }).catch(err => {
-                    console.error("Error durante el análisis offline:", err);
-                    statusDiv.textContent = 'Error durante el análisis offline.';
-                });
-            }
-
-
-            function startPlaybackAndVisualization() {
-                if (sourceNode) {
-                    try { sourceNode.stop(); } catch(e) {}
+                    statusDiv.textContent = 'Decodificando audio...';
+                    audioBuffer = await audioContext.decodeAudioData(e.target.result);
+                    statusDiv.textContent = 'Audio decodificado. Analizando onsets...';
+                    await analyzeOnsets(); // Contiene la lógica de Meyda ahora modificada
+                    statusDiv.textContent = `Análisis completo. ${detectedOnsets.length} onsets detectados. Reproduciendo...`;
+                    console.log("Onsets detectados:", detectedOnsets);
+                    startPlaybackAndVisualization();
+                } catch (error) {
+                    statusDiv.textContent = `Error procesando el audio: ${error.message}`;
+                    console.error('Error en reader.onload:', error);
+                    analyzeButton.disabled = false;
                 }
-                if (animationFrameId) {
-                    cancelAnimationFrame(animationFrameId);
-                }
-
-                sourceNode = audioContext.createBufferSource();
-                sourceNode.buffer = audioBuffer;
-                sourceNode.connect(audioContext.destination);
-
-                const startTime = audioContext.currentTime;
-                let onsetIndex = 0;
-
-                function visualizationLoop() {
-                    if (!sourceNode) return;
-
-                    const elapsedTime = audioContext.currentTime - startTime;
-
-                    while (onsetIndex < detectedOnsets.length && detectedOnsets[onsetIndex].timestamp <= elapsedTime + 0.05) {
-                        const onset = detectedOnsets[onsetIndex];
-                        onsetIndicator.textContent = onset.type.toUpperCase();
-                        onsetIndicator.className = `onset-display ${onset.type}`;
-                        visualizerDiv.style.backgroundColor = onset.type === 'grave' ? 'rgba(0, 0, 255, 0.2)' : 'rgba(255, 0, 0, 0.2)';
-
-                        setTimeout(() => {
-                             const currentElapsedTime = audioContext.currentTime - startTime; // Re-check time
-                             if(onsetIndex >= detectedOnsets.length || detectedOnsets[onsetIndex].timestamp > currentElapsedTime) {
-                                onsetIndicator.textContent = '';
-                                onsetIndicator.className = 'onset-display';
-                                visualizerDiv.style.backgroundColor = '#fff';
-                            }
-                        }, DISPLAY_DURATION);
-                         onsetIndex++;
-                    }
-
-                    if (elapsedTime < audioBuffer.duration) {
-                        animationFrameId = requestAnimationFrame(visualizationLoop);
-                    } else {
-                        // Limpieza final cuando la duración del buffer termina
-                        statusDiv.textContent = 'Reproducción finalizada.';
-                        onsetIndicator.textContent = '';
-                        onsetIndicator.className = 'onset-display';
-                        visualizerDiv.style.backgroundColor = '#fff';
-                        analyzeButton.disabled = false;
-                        sourceNode = null; // Limpiar para la próxima vez
-                    }
-                }
-
-                sourceNode.onended = () => {
-                     console.log("Playback ended event received.");
-                     if (animationFrameId) {
-                        cancelAnimationFrame(animationFrameId);
-                        animationFrameId = null; // Resetear ID
-                    }
-                     // Asegurar estado limpio al finalizar (importante si termina antes de lo esperado)
-                     if (!sourceNode) return; // Evitar doble limpieza si ya se hizo en el loop
-                     statusDiv.textContent = 'Reproducción finalizada.';
-                     onsetIndicator.textContent = '';
-                     onsetIndicator.className = 'onset-display';
-                     visualizerDiv.style.backgroundColor = '#fff';
-                     if(analyzeButton) analyzeButton.disabled = false;
-                     sourceNode = null;
-                 };
-
-
-                sourceNode.start(0);
-                animationFrameId = requestAnimationFrame(visualizationLoop);
-            }
-
-        }); // Fin del listener DOMContentLoaded
-
-    </script>
+                    
+                
 
 
 </body>
