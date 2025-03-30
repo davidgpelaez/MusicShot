@@ -81,8 +81,8 @@
     </div>
 
     <audio id="audioPlayer" style="display: none;"></audio>
-                          
-<script>
+                        
+        <script>
     document.addEventListener('DOMContentLoaded', (event) => {
         // *** Mensaje de prueba inicial ***
         console.log("Dentro de DOMContentLoaded. ¿Existe Meyda?:", window.Meyda);
@@ -166,8 +166,184 @@
                     console.error('Error en reader.onload:', error);
                     analyzeButton.disabled = false;
                 }
-                    
-                
+            };
+            reader.onerror = (error) => {
+                statusDiv.textContent = 'Error leyendo el archivo.';
+                console.error('Error FileReader:', error);
+                analyzeButton.disabled = false;
+            };
+            reader.readAsArrayBuffer(file);
+        });
+
+        async function analyzeOnsets() {
+            detectedOnsets = [];
+            if (!audioBuffer) return;
+
+            const offlineContext = new OfflineAudioContext(
+                audioBuffer.numberOfChannels,
+                audioBuffer.length,
+                audioBuffer.sampleRate
+            );
+            const offlineSource = offlineContext.createBufferSource();
+            offlineSource.buffer = audioBuffer;
+
+            try {
+                console.log("Intentando crear MeydaAnalyzer...");
+                meydaAnalyzer = Meyda.createMeydaAnalyzer({
+                    audioContext: offlineContext,
+                    source: offlineSource,
+                    bufferSize: MEYDA_BUFFER_SIZE,
+                    featureExtractors: ["rms", "spectralCentroid"], // Características necesarias
+                    callback: features => {
+                        // --- Inicio Lógica de Detección Paralela ---
+                        if (typeof meydaAnalyzer.lastRms === 'undefined') {
+                            meydaAnalyzer.lastRms = 0;
+                        }
+                        const currentRms = features.rms;
+                        const spectralCentroid = features.spectralCentroid;
+                        // Calcula el timestamp una sola vez por frame
+                        const timestamp = (meydaAnalyzer.framesElapsed * MEYDA_BUFFER_SIZE) / audioBuffer.sampleRate;
+                        let detectedThisFrame = null; // Variable para guardar si se detectó algo
+
+                        // CHECK 1: Detección Estándar (Umbrales más altos)
+                        if (currentRms > RMS_THRESHOLD && currentRms > meydaAnalyzer.lastRms * PEAK_MULTIPLIER) {
+                            const onsetType = spectralCentroid > SPECTRAL_CENTROID_THRESHOLD ? 'agudo' : 'grave';
+                            console.log(`Onset Estándar -> Tipo: ${onsetType}, RMS: ${currentRms.toFixed(3)}, Centroide: ${spectralCentroid.toFixed(0)} @${timestamp.toFixed(2)}s`);
+                            detectedThisFrame = { timestamp: timestamp, type: onsetType };
+                        }
+                        // CHECK 2: Detección Sensible SOLO para Agudos (si no se detectó antes y cumple condiciones)
+                        else if (currentRms > AGUDO_RMS_THRESHOLD &&
+                                 currentRms > meydaAnalyzer.lastRms * AGUDO_PEAK_MULTIPLIER &&
+                                 spectralCentroid > SPECTRAL_CENTROID_THRESHOLD) { // Solo si es agudo
+
+                            console.log(`Onset Agudo Sensible -> RMS: ${currentRms.toFixed(3)}, Centroide: ${spectralCentroid.toFixed(0)} @${timestamp.toFixed(2)}s`);
+                            detectedThisFrame = { timestamp: timestamp, type: 'agudo' };
+                        }
+
+                        // Aplicar Debounce y guardar si se detectó algo en este frame
+                        if (detectedThisFrame) {
+                            const lastOnset = detectedOnsets[detectedOnsets.length - 1];
+                            // Comprueba contra el último onset añadido, sin importar cómo se detectó
+                            if (!lastOnset || detectedThisFrame.timestamp > lastOnset.timestamp + DEBOUNCE_TIME) {
+                                detectedOnsets.push(detectedThisFrame);
+                            } else {
+                                // Opcional: Log para ver onsets descartados por debounce
+                                // console.log(`Onset descartado por debounce @${detectedThisFrame.timestamp.toFixed(2)}s`);
+                            }
+                        }
+
+                        meydaAnalyzer.lastRms = currentRms; // Actualizar para el próximo frame
+                        meydaAnalyzer.framesElapsed = (meydaAnalyzer.framesElapsed || 0) + 1;
+                         // --- Fin Lógica de Detección ---
+                    }
+                });
+                console.log("MeydaAnalyzer creado con éxito.");
+
+            } catch (e) {
+                console.error("ERROR al crear MeydaAnalyzer:", e);
+                statusDiv.textContent = "Error fatal: Fallo al inicializar Meyda.";
+                throw e;
+            }
+
+            meydaAnalyzer.start();
+            offlineSource.start(0);
+
+            return offlineContext.startRendering().then(() => {
+                meydaAnalyzer.stop();
+                console.log("Análisis offline completado.");
+            }).catch(err => {
+                console.error("Error durante el análisis offline:", err);
+                statusDiv.textContent = 'Error durante el análisis offline.';
+            });
+        }
+
+        function startPlaybackAndVisualization() {
+            if (sourceNode) {
+                try { sourceNode.stop(); } catch(e) {}
+            }
+            if (animationFrameId) {
+                cancelAnimationFrame(animationFrameId);
+            }
+
+            sourceNode = audioContext.createBufferSource();
+            sourceNode.buffer = audioBuffer;
+            sourceNode.connect(audioContext.destination);
+
+            const startTime = audioContext.currentTime;
+            let onsetIndex = 0;
+
+            function visualizationLoop() {
+                if (!sourceNode) return;
+
+                const elapsedTime = audioContext.currentTime - startTime;
+
+                // Muestra onsets mientras su tiempo sea menor o igual al tiempo de reproducción
+                while (onsetIndex < detectedOnsets.length && detectedOnsets[onsetIndex].timestamp <= elapsedTime) {
+                    const onset = detectedOnsets[onsetIndex];
+
+                    // Mostrar el indicador visual
+                    onsetIndicator.textContent = onset.type.toUpperCase();
+                    onsetIndicator.className = `onset-display ${onset.type}`;
+                    visualizerDiv.style.backgroundColor = onset.type === 'grave' ? 'rgba(0, 0, 255, 0.2)' : 'rgba(255, 0, 0, 0.2)';
+
+                    // Limpiar el indicador después de un tiempo
+                    // Usamos una IIFE (Immediately Invoked Function Expression) para capturar el índice correcto
+                    // o simplemente confiamos en que setTimeout es lo suficientemente rápido (generalmente lo es)
+                    // Para seguridad, podríamos pasar el índice o el propio onset al timeout si hubiera problemas.
+                    setTimeout(() => {
+                        // Solo limpiar si NO hay otro onset esperando inmediatamente
+                         const nextOnsetIndex = onsetIndex; // El índice ya se habrá incrementado si este fue el último procesado en el while
+                         const currentTimeCheck = audioContext.currentTime - startTime;
+                         if (nextOnsetIndex >= detectedOnsets.length || detectedOnsets[nextOnsetIndex].timestamp > currentTimeCheck) {
+                            onsetIndicator.textContent = '';
+                            onsetIndicator.className = 'onset-display';
+                            visualizerDiv.style.backgroundColor = '#fff';
+                         }
+                    }, DISPLAY_DURATION);
+
+                    onsetIndex++; // Avanzar al siguiente onset detectado
+                }
+
+
+                // Continuar el bucle si la reproducción no ha terminado
+                if (elapsedTime < audioBuffer.duration + 0.1) { // Añadimos un pequeño margen
+                    animationFrameId = requestAnimationFrame(visualizationLoop);
+                } else {
+                     // Limpieza final explícita al terminar la duración del buffer
+                     statusDiv.textContent = 'Reproducción finalizada.';
+                     onsetIndicator.textContent = '';
+                     onsetIndicator.className = 'onset-display';
+                     visualizerDiv.style.backgroundColor = '#fff';
+                     if(analyzeButton) analyzeButton.disabled = false;
+                     sourceNode = null;
+                     animationFrameId = null;
+                }
+            }
+
+             sourceNode.onended = () => {
+                 console.log("Playback ended event received.");
+                 // Esta función puede llamarse ligeramente antes de que elapsedTime supere la duración
+                 // Aseguramos la limpieza final aquí también por si acaso.
+                  if (animationFrameId) {
+                     cancelAnimationFrame(animationFrameId);
+                     animationFrameId = null;
+                 }
+                 if (!sourceNode) return; // Evitar doble limpieza
+                 statusDiv.textContent = 'Reproducción finalizada.';
+                 onsetIndicator.textContent = '';
+                 onsetIndicator.className = 'onset-display';
+                 visualizerDiv.style.backgroundColor = '#fff';
+                 if(analyzeButton) analyzeButton.disabled = false;
+                 sourceNode = null;
+             };
+
+            sourceNode.start(0);
+            animationFrameId = requestAnimationFrame(visualizationLoop);
+        }
+
+    }); // Fin del listener DOMContentLoaded
+        </script>
+    
 
 
 </body>
